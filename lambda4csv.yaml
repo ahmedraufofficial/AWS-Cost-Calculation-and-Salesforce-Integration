@@ -1,0 +1,366 @@
+Parameters:
+  SalesforceBucketName:
+    Type: String
+    Default: 
+    Description: "Bucket where reports will be uploaded"
+  LibraryBucketName:
+    Type: String
+    Default: 
+    Description: "S3 bucket for Simple Salesforce Python 3.7 library"
+
+
+Resources:
+  MyIAMUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: salesforce-user
+
+  MyIAMUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: salesforce-user-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource:
+              - !GetAtt MonthlyCostBucket.Arn
+              - !Join
+                - ''
+                - - !GetAtt MonthlyCostBucket.Arn
+                  - '/*'
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt MyFunction.Arn
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !ImportValue SalesforceSecretArn
+      Users:
+        - !Ref MyIAMUser
+  
+  MyAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref MyIAMUser
+  
+  MonthlyCostBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaInvokePermission
+    Properties:
+      BucketName: !Ref SalesforceBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: cur/MonthlyCostReport/
+                  - Name: suffix
+                    Value: .json
+            Function: !GetAtt MyFunction.Arn
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: MonthlyCostBucket
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref MyFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${SalesforceBucketName}"
+      SourceAccount: !Ref AWS::AccountId
+
+  MonthlyCostBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref 'MonthlyCostBucket'
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref 'MonthlyCostBucket'
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref 'MonthlyCostBucket'
+                - /*
+
+  MonthlyCostReport:
+    Type: AWS::CUR::ReportDefinition
+    DependsOn:
+      - MonthlyCostBucketPolicy
+    Properties:
+      ReportName: MonthlyCostReport
+      TimeUnit: MONTHLY
+      Format: textORcsv
+      S3Bucket: !Ref MonthlyCostBucket
+      S3Prefix: cur/
+      S3Region: us-east-1
+      Compression: GZIP
+      RefreshClosedReports: true
+      ReportVersioning: OVERWRITE_REPORT
+
+  MyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: my-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: S3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            Resource: "arn:aws:s3:::${LibraryBucketName}/*"
+
+  CustomLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.7
+      Content:
+        S3Bucket: !Ref LibraryBucketName
+        S3Key: shell-lambda-package.zip
+      Description: My custom layer
+
+  MyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import boto3
+          import pandas as pd
+          import os
+          import gzip
+          import io
+          from botocore.exceptions import ClientError
+          from simple_salesforce import Salesforce
+
+          def get_secret():
+              secret_name = ""
+              region_name = "us-east-1"
+              client = boto3.client(aws_access_key_id=os.environ.get('IAM_ACCESS_ID'), aws_secret_access_key=os.environ.get('IAM_SECRET_KEY'), service_name='secretsmanager', region_name=region_name)
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+                  secret = json.loads(get_secret_value_response['SecretString'])
+                  return secret
+              except ClientError as e:
+                  print(e)
+                  return {"username":"","password":"","security_token":""}
+
+
+          def getMasterAws(billing_entity, df):
+              master = {}
+              AWS = df[df['bill/BillingEntity'] == billing_entity]
+              services = AWS.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+              services = services.sort_values('lineItem/UsageAccountId', ascending=True)
+
+              charges = AWS[(AWS['lineItem/LineItemType'] != 'SavingsPlanNegation') & (AWS['lineItem/LineItemType'] != 'SppDiscount') & (AWS['lineItem/LineItemType'] != 'PrivateRateDiscount') & (AWS['lineItem/LineItemType'] != 'Credit') & (AWS['lineItem/LineItemType'] != 'Refund')]
+              total_c = charges['lineItem/UnblendedCost'].sum()
+
+              if billing_entity == 'AWS':
+                  savings_negation = AWS[AWS['lineItem/LineItemType'] == 'SavingsPlanNegation']
+                  spp_discount = AWS[AWS['lineItem/LineItemType'] == 'SppDiscount']
+                  private_rate_discount = AWS[AWS['lineItem/LineItemType'] == 'PrivateRateDiscount']
+                  credit = AWS[AWS['lineItem/LineItemType'] == 'Credit']
+                  refund = AWS[AWS['lineItem/LineItemType'] == 'Refund']
+                  total_sp = spp_discount['lineItem/UnblendedCost'].sum()
+                  total_sn = savings_negation['lineItem/UnblendedCost'].sum()
+                  total_pr = private_rate_discount['lineItem/UnblendedCost'].sum()
+                  total_cr = credit['lineItem/UnblendedCost'].sum()
+                  total_rf = refund['lineItem/UnblendedCost'].sum()
+                  aws_service_charges = total_c + total_sp + total_sn + total_pr + total_cr + total_rf
+                  master["masterSppDiscount"] = "{:.2f}".format(float(total_sp))
+                  master["masterSavingsPlan"] = "{:.2f}".format(float(total_sn))
+                  master["masterPrivateRateDiscount"] = "{:.2f}".format(float(total_pr))
+                  master["masterCredits"] = "{:.2f}".format(float(total_cr))
+                  master["masterRefund"] = "{:.2f}".format(float(total_rf))
+                  master["masterAwsServiceCharges"] = "{:.2f}".format(float(aws_service_charges))
+              master["masterCharges"] = "{:.2f}".format(float(total_c))
+              return master
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3', aws_access_key_id=os.environ.get('IAM_ACCESS_ID'), aws_secret_access_key=os.environ.get('IAM_SECRET_KEY'))
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              prefix = key.split('/')
+              prefix.pop()
+              prefix = '/'.join(prefix)
+              
+              response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+              manifest = s3.get_object(Bucket=bucket, Key=key)
+              json_contents = manifest['Body'].read().decode('utf-8')
+              data = json.loads(json_contents)
+              csv_file_gz = ""
+              for obj in response['Contents']:
+                  if ".csv.gz" in obj['Key']:
+                      csv_file_gz = obj['Key']
+                      break
+                  
+              csv_file_s3 = s3.get_object(Bucket=bucket, Key=csv_file_gz)
+              content = csv_file_s3['Body'].read()
+              unzipped_content = gzip.decompress(content)
+              df = pd.read_csv(io.StringIO(unzipped_content.decode()))
+
+              awsBasic = getMasterAws('AWS', df)
+              awsMarketplace = getMasterAws('AWS Marketplace', df)
+              AWS = df[df['bill/BillingEntity'] == 'AWS']
+              account_group = AWS.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+              account_ids = list(account_group.groupby(['lineItem/UsageAccountId']).groups.keys())
+              cost_dict = {}
+              input_date_str = data['billingPeriod']['start'].split('T')[0]
+              year = input_date_str[:4]
+              month = input_date_str[4:6]
+              day = input_date_str[6:]
+              output_date_str = f'{year}-{month}-{day}'
+              input_end_date_str = data['billingPeriod']['end'].split('T')[0]
+              year_end = input_end_date_str[:4]
+              month_end = input_end_date_str[4:6]
+              day_end = input_end_date_str[6:]
+              output_end_date_str = f'{year_end}-{month_end}-{day_end}'
+              for account in account_ids:
+                  AWS = account_group[account_group['lineItem/UsageAccountId'] == int(account)]
+                  cost_dict[account] = {}
+                  charges = AWS[(AWS['lineItem/LineItemType'] != 'SavingsPlanNegation') & (AWS['lineItem/LineItemType'] != 'SppDiscount') & (AWS['lineItem/LineItemType'] != 'PrivateRateDiscount') & (AWS['lineItem/LineItemType'] != 'Credit') & (AWS['lineItem/LineItemType'] != 'Refund')]
+                  savings_negation = AWS[AWS['lineItem/LineItemType'] == 'SavingsPlanNegation']
+                  spp_discount = AWS[AWS['lineItem/LineItemType'] == 'SppDiscount']
+                  private_rate_discount = AWS[AWS['lineItem/LineItemType'] == 'PrivateRateDiscount']
+                  credit = AWS[AWS['lineItem/LineItemType'] == 'Credit']
+                  refund = AWS[AWS['lineItem/LineItemType'] == 'Refund']
+                  charges = charges.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_c = charges['lineItem/UnblendedCost'].sum()
+                  spp_discount = spp_discount.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_sp = spp_discount['lineItem/UnblendedCost'].sum()
+                  savings_negation = savings_negation.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_sn = savings_negation['lineItem/UnblendedCost'].sum()
+                  private_rate_discount = private_rate_discount.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_pr = private_rate_discount['lineItem/UnblendedCost'].sum()
+                  credit = credit.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_cr = credit['lineItem/UnblendedCost'].sum()
+                  refund = refund.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_rf = refund['lineItem/UnblendedCost'].sum()
+                  aws_service_charges = total_c + total_sp + total_sn + total_pr + total_cr + total_rf
+                  cost_dict[account]["childAccountId"] = "{}".format(account)
+                  cost_dict[account]["charges"] = "{:.2f}".format(float(total_c))
+                  cost_dict[account]["sppDiscount"] = "{:.2f}".format(float(total_sp))
+                  cost_dict[account]["savingsPlan"] = "{:.2f}".format(float(total_sn))
+                  cost_dict[account]["privateRateDiscount"] = "{:.2f}".format(float(total_pr))
+                  cost_dict[account]["credits"] = "{:.2f}".format(float(total_cr))
+                  cost_dict[account]["refund"] = "{:.2f}".format(float(total_rf))
+                  cost_dict[account]["awsServiceCharges"] = "{:.2f}".format(float(aws_service_charges))
+                  cost_dict[account]["masterCharges"] = awsBasic["masterCharges"]
+                  cost_dict[account]["masterSppDiscount"] = awsBasic["masterSppDiscount"]
+                  cost_dict[account]["masterSavingsPlan"] = awsBasic["masterSavingsPlan"]
+                  cost_dict[account]["masterMarketplaceCharges"] = awsMarketplace["masterCharges"]
+                  cost_dict[account]["masterPrivateRateDiscount"] = awsBasic["masterPrivateRateDiscount"]
+                  cost_dict[account]["masterCredits"] = awsBasic["masterCredits"]
+                  cost_dict[account]["masterRefund"] = awsBasic["masterRefund"]
+                  cost_dict[account]["masterAccountId"] = "{}".format(data['account'])
+                  cost_dict[account]["startDate"] = output_date_str
+                  cost_dict[account]["endDate"] = output_end_date_str
+                  
+              AWS = df[df['bill/BillingEntity'] == 'AWS Marketplace']
+              account_group = AWS.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+              account_ids = list(account_group.groupby(['lineItem/UsageAccountId']).groups.keys())
+              for account in account_ids:
+                  AWS = account_group[account_group['lineItem/UsageAccountId'] == int(account)]
+                  charges = AWS[(AWS['lineItem/LineItemType'] != 'SavingsPlanNegation') & (AWS['lineItem/LineItemType'] != 'SppDiscount') & (AWS['lineItem/LineItemType'] != 'PrivateRateDiscount') & (AWS['lineItem/LineItemType'] != 'Credit') & (AWS['lineItem/LineItemType'] != 'Refund')]
+                  savings_negation = AWS[AWS['lineItem/LineItemType'] == 'SavingsPlanNegation']
+                  spp_discount = AWS[AWS['lineItem/LineItemType'] == 'SppDiscount']
+                  private_rate_discount = AWS[AWS['lineItem/LineItemType'] == 'PrivateRateDiscount']
+                  credit = AWS[AWS['lineItem/LineItemType'] == 'Credit']
+                  refund = AWS[AWS['lineItem/LineItemType'] == 'Refund']
+                  charges = charges.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_c = charges['lineItem/UnblendedCost'].sum()
+                  spp_discount = spp_discount.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_sp = spp_discount['lineItem/UnblendedCost'].sum()
+                  savings_negation = savings_negation.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_sn = savings_negation['lineItem/UnblendedCost'].sum()
+                  private_rate_discount = private_rate_discount.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_pr = private_rate_discount['lineItem/UnblendedCost'].sum()
+                  credit = credit.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_cr = credit['lineItem/UnblendedCost'].sum()
+                  refund = refund.groupby(['lineItem/LineItemType','lineItem/UsageAccountId'], as_index=False)[['lineItem/UnblendedCost','lineItem/BlendedCost','lineItem/NetUnblendedCost']].sum()
+                  total_rf = refund['lineItem/UnblendedCost'].sum()
+                  aws_service_charges = total_c + total_sp + total_sn + total_pr + total_cr + total_rf
+                  if int(account) in cost_dict:
+                      cost_dict[int(account)]["marketplaceCharges"] = "{:.2f}".format(float(aws_service_charges))
+                  else:
+                      cost_dict[account] = {}
+                      cost_dict[account]["childAccountId"] = "{}".format(account)
+                      cost_dict[account]["marketplaceCharges"] = "{:.2f}".format(float(aws_service_charges))
+                      cost_dict[account]["masterCharges"] = awsBasic["masterCharges"]
+                      cost_dict[account]["masterSppDiscount"] = awsBasic["masterSppDiscount"]
+                      cost_dict[account]["masterSavingsPlan"] = awsBasic["masterSavingsPlan"]
+                      cost_dict[account]["masterMarketplaceCharges"] = awsMarketplace["masterCharges"]
+                      cost_dict[account]["masterPrivateRateDiscount"] = awsBasic["masterPrivateRateDiscount"]
+                      cost_dict[account]["masterCredits"] = awsBasic["masterCredits"]
+                      cost_dict[account]["masterRefund"] = awsBasic["masterRefund"]
+                      cost_dict[account]["masterAccountId"] = "{}".format(data['account'])
+                      cost_dict[account]["startDate"] = output_date_str
+                      cost_dict[account]["endDate"] = output_end_date_str
+
+              cost_arr = list(cost_dict.values())
+              secret = get_secret()
+              sf = Salesforce(password=secret["password"], username=secret["username"], security_token=secret["security_token"], domain='test')
+              result = sf.apexecute('awsusage/addusage/', method='POST', data=cost_arr)
+              print(result)
+              return "success"
+      FunctionName: my-function
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 3008
+      Timeout: 30
+      Environment:
+        Variables:
+          IAM_ACCESS_ID: !Ref MyAccessKey
+          IAM_SECRET_KEY: !GetAtt MyAccessKey.SecretAccessKey
+      Role: !GetAtt MyLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python37:4
+        - !Ref CustomLayer
